@@ -4,6 +4,17 @@
 (define-constant early-withdrawal-fee u10)
 (define-constant contract-version "1.0.0")
 
+;; Milestone system constants
+(define-constant milestone-tier-1 u10000)     ;; 10K STX
+(define-constant milestone-tier-2 u25000)     ;; 25K STX
+(define-constant milestone-tier-3 u50000)     ;; 50K STX
+(define-constant milestone-tier-4 u100000)    ;; 100K STX
+(define-constant milestone-tier-5 u250000)    ;; 250K STX
+
+;; Milestone error constants
+(define-constant err-no-rewards-available (err u50))
+(define-constant err-milestone-not-achieved (err u51))
+
 (define-data-var total-deposits uint u0)
 (define-data-var total-participants uint u0)
 (define-data-var vault-active bool true)
@@ -49,6 +60,28 @@
 (define-map participant-beneficiary-count
     { participant: principal }
     { count: uint }
+)
+
+;; Milestone tracking data maps
+(define-map milestone-achievements
+    { participant: principal }
+    {
+        tier-1: bool,
+        tier-2: bool,
+        tier-3: bool,
+        tier-4: bool,
+        tier-5: bool,
+        highest-tier: uint,
+    }
+)
+
+(define-map milestone-rewards
+    { participant: principal }
+    {
+        claimable-amount: uint,
+        total-earned: uint,
+        last-claim-block: uint,
+    }
 )
 
 (define-read-only (get-participant-data (participant principal))
@@ -99,6 +132,7 @@
                 (err u4)
             ))
             (current-height stacks-block-height)
+            (new-balance (+ (get total-balance participant-info) amount))
         )
         (asserts! (>= amount min-deposit) (err u5))
         (asserts!
@@ -109,12 +143,16 @@
         )
         (map-set participant-data { participant: tx-sender }
             (merge participant-info {
-                total-balance: (+ (get total-balance participant-info) amount),
+                total-balance: new-balance,
                 last-deposit: current-height,
                 stx-balance: (+ (get stx-balance participant-info) amount),
             })
         )
         (var-set total-deposits (+ (var-get total-deposits) amount))
+        
+        ;; Check and update milestone achievements
+        (check-milestone-achievement tx-sender new-balance)
+        
         (ok true)
     )
 )
@@ -391,6 +429,139 @@
             data
         )
         data
+    )
+)
+
+;; Milestone helper functions
+(define-private (calculate-milestone-reward (tier uint) (balance uint))
+    (let (
+        (base-reward (/ (* balance u5) u100))  ;; 5% of balance as base reward
+        (tier-multiplier (if (is-eq tier u1) u100
+            (if (is-eq tier u2) u125
+            (if (is-eq tier u3) u150
+            (if (is-eq tier u4) u175
+            (if (is-eq tier u5) u200 u100))))))
+    )
+    (/ (* base-reward tier-multiplier) u100)
+    )
+)
+
+(define-private (check-milestone-achievement (participant principal) (new-balance uint))
+    (let (
+        (achievements (default-to {
+            tier-1: false,
+            tier-2: false,
+            tier-3: false,
+            tier-4: false,
+            tier-5: false,
+            highest-tier: u0,
+        } (map-get? milestone-achievements { participant: participant })))
+        (current-height stacks-block-height)
+    )
+    ;; Check each tier and award rewards for newly achieved milestones
+    (if (and (not (get tier-1 achievements)) (>= new-balance milestone-tier-1))
+        (award-milestone-reward participant u1 new-balance current-height) true)
+    (if (and (not (get tier-2 achievements)) (>= new-balance milestone-tier-2))
+        (award-milestone-reward participant u2 new-balance current-height) true)
+    (if (and (not (get tier-3 achievements)) (>= new-balance milestone-tier-3))
+        (award-milestone-reward participant u3 new-balance current-height) true)
+    (if (and (not (get tier-4 achievements)) (>= new-balance milestone-tier-4))
+        (award-milestone-reward participant u4 new-balance current-height) true)
+    (if (and (not (get tier-5 achievements)) (>= new-balance milestone-tier-5))
+        (award-milestone-reward participant u5 new-balance current-height) true)
+    
+    ;; Update milestone achievements
+    (map-set milestone-achievements { participant: participant } {
+        tier-1: (or (get tier-1 achievements) (>= new-balance milestone-tier-1)),
+        tier-2: (or (get tier-2 achievements) (>= new-balance milestone-tier-2)),
+        tier-3: (or (get tier-3 achievements) (>= new-balance milestone-tier-3)),
+        tier-4: (or (get tier-4 achievements) (>= new-balance milestone-tier-4)),
+        tier-5: (or (get tier-5 achievements) (>= new-balance milestone-tier-5)),
+        highest-tier: (if (>= new-balance milestone-tier-5) u5
+            (if (>= new-balance milestone-tier-4) u4
+            (if (>= new-balance milestone-tier-3) u3
+            (if (>= new-balance milestone-tier-2) u2
+            (if (>= new-balance milestone-tier-1) u1 u0))))),
+    })
+    true
+    )
+)
+
+(define-private (award-milestone-reward (participant principal) (tier uint) (balance uint) (block-ht uint))
+    (let (
+        (reward-amount (calculate-milestone-reward tier balance))
+        (current-rewards (default-to {
+            claimable-amount: u0,
+            total-earned: u0,
+            last-claim-block: u0,
+        } (map-get? milestone-rewards { participant: participant })))
+    )
+    (map-set milestone-rewards { participant: participant } {
+        claimable-amount: (+ (get claimable-amount current-rewards) reward-amount),
+        total-earned: (+ (get total-earned current-rewards) reward-amount),
+        last-claim-block: (get last-claim-block current-rewards),
+    })
+    true
+    )
+)
+
+;; Public milestone functions
+(define-public (claim-milestone-rewards)
+    (let (
+        (participant-info (unwrap! (map-get? participant-data { participant: tx-sender })
+            (err u4)
+        ))
+        (rewards-info (unwrap! (map-get? milestone-rewards { participant: tx-sender })
+            err-no-rewards-available
+        ))
+        (claimable (get claimable-amount rewards-info))
+    )
+    (asserts! (> claimable u0) err-no-rewards-available)
+    
+    ;; Update milestone rewards
+    (map-set milestone-rewards { participant: tx-sender }
+        (merge rewards-info {
+            claimable-amount: u0,
+            last-claim-block: stacks-block-height,
+        })
+    )
+    
+    ;; Update participant balance with claimed rewards
+    (map-set participant-data { participant: tx-sender }
+        (merge participant-info {
+            total-balance: (+ (get total-balance participant-info) claimable),
+            stx-balance: (+ (get stx-balance participant-info) claimable),
+            yield-earned: (+ (get yield-earned participant-info) claimable),
+        })
+    )
+    
+    (ok claimable)
+    )
+)
+
+;; Milestone read-only functions
+(define-read-only (get-milestone-achievements (participant principal))
+    (map-get? milestone-achievements { participant: participant })
+)
+
+(define-read-only (get-milestone-rewards (participant principal))
+    (map-get? milestone-rewards { participant: participant })
+)
+
+(define-read-only (get-milestone-constants)
+    (ok {
+        tier-1-threshold: milestone-tier-1,
+        tier-2-threshold: milestone-tier-2,
+        tier-3-threshold: milestone-tier-3,
+        tier-4-threshold: milestone-tier-4,
+        tier-5-threshold: milestone-tier-5,
+    })
+)
+
+(define-read-only (calculate-potential-milestone-reward (participant principal) (tier uint))
+    (match (map-get? participant-data { participant: participant })
+        data (ok (calculate-milestone-reward tier (get total-balance data)))
+        (err u4)
     )
 )
 
